@@ -3,7 +3,8 @@
  * Rate Limit Retry Hook
  *
  * 检测 Claude Code 会话中的 429 限流错误，并根据配置自动安排重试通知。
- * 同时作为 Stop hook 和 Notification hook 使用：
+ * 支持三种触发场景：
+ *   - PostToolUse (Bash)：直接扫描工具输出，捕获 API 调用返回的限流错误
  *   - Stop hook：读取 transcript，扫描最近条目中的限流信号
  *   - Notification hook：直接扫描 stdin 中的通知文本
  *
@@ -63,6 +64,13 @@ const RATE_LIMIT_PATTERNS = [
   /too many requests/i,
   /resets?\s+\d+\s*(am|pm)/i,
   /request.?limit.?exceeded/i,
+  // 中文 API 网关（百度、阿里、腾讯等代理格式）
+  /throttling/i,
+  /\bTPM\b/,
+  /\bRPM\b/,
+  /err_code.*429/i,
+  /"err_code"\s*:\s*429/,
+  /err_msg.*throttl/i,
 ];
 
 function detectRateLimit(text) {
@@ -377,28 +385,54 @@ async function main() {
   // ── 解析 stdin ──
   let transcriptPath = null;
   let inlineText = stdinData;
+  let isPostToolUse = false;
+  let toolOutput = '';
 
   try {
     const input = JSON.parse(stdinData);
     transcriptPath = input.transcript_path || null;
-    inlineText = JSON.stringify(input); // 完整序列化便于扫描
+    inlineText = JSON.stringify(input);
+
+    // PostToolUse 场景：有 tool_name 且有工具输出
+    if (input.tool_name || input.tool_input) {
+      isPostToolUse = true;
+      // 兼容不同版本的字段名
+      toolOutput =
+        input.tool_response?.output ||
+        input.tool_output?.output ||
+        input.tool_response?.content ||
+        '';
+      dbg(`PostToolUse mode, tool: ${input.tool_name}, output length: ${toolOutput.length}`);
+    }
   } catch {
-    // stdin 不是 JSON，当作纯文本处理（不影响流程）
+    // stdin 不是 JSON，当作纯文本处理
   }
 
-  // ── 双层检测 ──
+  // PostToolUse：必须把 stdin 原样透传给 Claude Code，不能截断
+  if (isPostToolUse) {
+    process.stdout.write(stdinData);
+  }
+
+  // ── 三层检测 ──
   let found = false;
   let errorText = '';
   let lastUserMessage = '';
 
-  // 1. Notification hook：直接扫描 stdin 文本
-  if (detectRateLimit(inlineText)) {
+  // 1. PostToolUse Bash：直接扫描工具输出（最准确的来源）
+  if (isPostToolUse && toolOutput && detectRateLimit(toolOutput)) {
+    found = true;
+    errorText = toolOutput;
+    dbg('Rate limit detected in tool output');
+  }
+
+  // 2. Notification hook / 通用 stdin 扫描
+  if (!found && detectRateLimit(inlineText)) {
     found = true;
     errorText = inlineText;
     dbg('Rate limit detected in stdin/notification data');
   }
 
-  // 2. Stop hook：扫描 transcript
+  // 3. Stop hook：扫描 transcript
   if (!found && transcriptPath) {
     const result = scanTranscript(transcriptPath);
     found = result.found;
