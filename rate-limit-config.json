@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "retryDelay": 300,
+  "retryMode": "until-reset",
+  "maxRetries": 5,
+  "notification": {
+    "enabled": true,
+    "sound": true,
+    "message": "Rate limit 已重置，爹可以继续工作了"
+  },
+  "autoResume": false,
+  "logFile": "~/.claude/rate-limit-log.jsonl"
+}
