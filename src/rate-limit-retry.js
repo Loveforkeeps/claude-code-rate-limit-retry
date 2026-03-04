@@ -53,29 +53,64 @@ function loadConfig() {
   return DEFAULT_CONFIG;
 }
 
-// ─── 限流检测 ──────────────────────────────────────────────────────────────────
+// ─── 限流检测（评分机制，避免误报）─────────────────────────────────────────────
 
-const RATE_LIMIT_PATTERNS = [
-  /\b429\b/,
-  /rate.?limit/i,
-  /you'?ve hit your limit/i,
-  /usage.?limit/i,
-  /quota.?exceeded/i,
-  /too many requests/i,
-  /resets?\s+\d+\s*(am|pm)/i,
-  /request.?limit.?exceeded/i,
-  // 中文 API 网关（百度、阿里、腾讯等代理格式）
-  /throttling/i,
-  /\bTPM\b/,
-  /\bRPM\b/,
-  /err_code.*429/i,
-  /"err_code"\s*:\s*429/,
-  /err_msg.*throttl/i,
+// 强信号（单独命中即判定为限流，权重 10）
+const STRONG_PATTERNS = [
+  /\bstatus[_\s"':]*429\b/i,           // HTTP status 429
+  /\bHTTP[\/\s]*\d\.\d\s+429\b/,       // HTTP/1.1 429
+  /\b429\s+Too Many Requests\b/i,      // 标准 HTTP 429 短语
+  /you'?ve hit your limit/i,           // Claude 官方限流提示
+  /request.?limit.?exceeded/i,         // API 限流标准消息
+  /quota.?exceeded/i,                  // 配额超限
+  /"err_code"\s*:\s*429/,              // 中文网关 JSON 格式
+  /err_code.*429.*throttl/i,           // 中文网关组合信号
+];
+
+// 弱信号（需要至少 2 个同时命中才判定，权重 1）
+const WEAK_PATTERNS = [
+  /rate.?limit(?:ed|ing)?\b/i,         // rate limit/limited/limiting
+  /too many requests/i,                // 通用限流消息
+  /usage.?limit/i,                     // 用量限制
+  /resets?\s+\d+\s*(am|pm)/i,          // 重置时间提示
+  /retry.{0,10}after\s+\d+/i,         // retry-after 头
+  /throttl(?:ed|ing)\b/i,             // throttled/throttling（要求完整词）
+  /err_msg.*throttl/i,                // 错误消息含 throttle
+  /\bTPM\b.*(?:limit|exceed|quota)/i, // TPM + 限流上下文
+  /\bRPM\b.*(?:limit|exceed|quota)/i, // RPM + 限流上下文
+];
+
+// 误报排除：如果文本匹配这些模式，直接跳过（源码、注释、正则定义等）
+const FALSE_POSITIVE_PATTERNS = [
+  /\/.*429.*\//,                       // 正则字面量中包含 429
+  /['"`].*429.*['"`]\s*[,;)]/,         // 字符串字面量中的 429
+  /\bconst\b.*PATTERN/i,              // 模式定义行
+  /\bfunction\b.*detect/i,            // 检测函数定义
+  /\/\/.*429/,                         // 注释中的 429
+  /\btest\b.*429/i,                    // 测试代码中的 429
 ];
 
 function detectRateLimit(text) {
   if (!text) return false;
-  return RATE_LIMIT_PATTERNS.some(p => p.test(text));
+
+  // 排除已知误报场景
+  if (FALSE_POSITIVE_PATTERNS.some(p => p.test(text))) {
+    dbg('Skipped: matched false positive exclusion pattern');
+    return false;
+  }
+
+  // 强信号：命中任意一个即判定
+  if (STRONG_PATTERNS.some(p => p.test(text))) {
+    return true;
+  }
+
+  // 弱信号：需要至少 2 个同时命中
+  const weakHits = WEAK_PATTERNS.filter(p => p.test(text)).length;
+  if (weakHits >= 2) {
+    return true;
+  }
+
+  return false;
 }
 
 // ─── 时间解析 ──────────────────────────────────────────────────────────────────
@@ -170,10 +205,25 @@ function scanTranscript(transcriptPath, maxLines = 60) {
     for (const line of recent) {
       try {
         const entry = JSON.parse(line);
-        const serialized = JSON.stringify(entry);
 
-        if (detectRateLimit(serialized)) {
-          errorText = serialized;
+        // 只扫描错误相关字段，不扫描整个 JSON（避免源码/工具输出误报）
+        const fieldsToScan = [
+          entry.error,
+          entry.message?.error,
+          entry.errorMessage,
+          entry.data?.error,
+          entry.data?.message,
+          // assistant 类型的文本内容（可能包含 Claude 返回的限流提示）
+          (entry.type === 'assistant' || entry.role === 'assistant' || entry.message?.role === 'assistant')
+            ? (typeof (entry.message?.content ?? entry.content) === 'string'
+                ? (entry.message?.content ?? entry.content)
+                : '')
+            : null,
+        ].filter(Boolean);
+
+        const scanText = fieldsToScan.map(f => typeof f === 'string' ? f : JSON.stringify(f)).join(' ');
+        if (scanText && detectRateLimit(scanText)) {
+          errorText = scanText;
         }
 
         // 收集最后一条用户消息，用于后续上下文保存
@@ -208,18 +258,80 @@ function scanTranscript(transcriptPath, maxLines = 60) {
 // ─── 通知与调度 ────────────────────────────────────────────────────────────────
 
 /**
- * 立即发送系统通知（告知正在等待）
+ * 检测 terminal-notifier 是否可用
  */
-function sendImmediateNotification(message) {
-  if (process.platform === 'darwin') {
+let _hasTerminalNotifier = null;
+function hasTerminalNotifier() {
+  if (_hasTerminalNotifier !== null) return _hasTerminalNotifier;
+  try {
+    execSync('which terminal-notifier', { timeout: 2000, stdio: 'ignore' });
+    _hasTerminalNotifier = true;
+  } catch {
+    _hasTerminalNotifier = false;
+  }
+  return _hasTerminalNotifier;
+}
+
+/**
+ * 获取日志文件路径（用于点击通知时打开）
+ */
+function getLogFilePath(config) {
+  const logPath = config.logFile
+    ? config.logFile.replace(/^~/, os.homedir())
+    : path.join(os.homedir(), '.claude', 'rate-limit-log.jsonl');
+  return logPath;
+}
+
+/**
+ * 发送 macOS 通知，优先使用 terminal-notifier（支持点击打开日志）
+ * 降级到 osascript（不支持点击动作）
+ */
+function sendMacNotification(title, message, config, options = {}) {
+  const { sound = false, openFile = null } = options;
+
+  if (hasTerminalNotifier()) {
+    const args = [
+      '-title', title,
+      '-message', message,
+      '-group', 'claude-rate-limit',
+    ];
+    if (sound) args.push('-sound', 'Ping');
+    if (openFile) args.push('-open', `file://${openFile}`);
     try {
       execSync(
-        `osascript -e 'display notification "${escapeOsa(message)}" with title "Claude Code ⏳"'`,
+        `terminal-notifier ${args.map(a => `"${escapeShell(a)}"`).join(' ')}`,
         { timeout: 3000, stdio: 'ignore' }
       );
     } catch {
-      // 非致命错误，静默忽略
+      // 降级到 osascript
+      sendOsascriptNotification(title, message, sound);
     }
+    return;
+  }
+
+  sendOsascriptNotification(title, message, sound);
+}
+
+function sendOsascriptNotification(title, message, sound) {
+  try {
+    const soundPart = sound ? ' sound name "Ping"' : '';
+    execSync(
+      `osascript -e 'display notification "${escapeOsa(message)}" with title "${escapeOsa(title)}"${soundPart}'`,
+      { timeout: 3000, stdio: 'ignore' }
+    );
+  } catch {
+    // 非致命
+  }
+}
+
+/**
+ * 立即发送系统通知（告知正在等待）
+ */
+function sendImmediateNotification(message, config) {
+  if (process.platform === 'darwin') {
+    sendMacNotification('Claude Code ⏳', message, config, {
+      openFile: getLogFilePath(config),
+    });
   }
 }
 
@@ -230,11 +342,26 @@ function sendImmediateNotification(message) {
 function scheduleDelayedNotification(waitSeconds, config) {
   const msg = config.notification.message;
   const sound = config.notification.sound;
+  const logFile = getLogFilePath(config);
 
   if (process.platform === 'darwin') {
-    const osaMsgPart = `display notification "${escapeOsa(msg)}" with title "Claude Code ✅"${sound ? ' sound name "Ping"' : ''}`;
+    let notifyCmd;
+    if (hasTerminalNotifier()) {
+      const args = [
+        '-title', 'Claude Code ✅',
+        '-message', msg,
+        '-group', 'claude-rate-limit',
+        '-open', `file://${logFile}`,
+      ];
+      if (sound) args.push('-sound', 'Ping');
+      notifyCmd = `terminal-notifier ${args.map(a => `"${escapeShell(a)}"`).join(' ')}`;
+    } else {
+      const soundPart = sound ? ' sound name "Ping"' : '';
+      notifyCmd = `osascript -e 'display notification "${escapeOsa(msg)}" with title "Claude Code ✅"${soundPart}'`;
+    }
+
     const sayPart = sound ? ` && say "${escapeShell(msg)}"` : '';
-    const cmd = `sleep ${waitSeconds} && osascript -e '${osaMsgPart}'${sayPart}`;
+    const cmd = `sleep ${waitSeconds} && ${notifyCmd}${sayPart}`;
 
     const child = spawn('sh', ['-c', cmd], {
       detached: true,
@@ -245,7 +372,6 @@ function scheduleDelayedNotification(waitSeconds, config) {
   }
 
   if (process.platform === 'linux') {
-    // 尝试 notify-send（需要 libnotify）
     const cmd = `sleep ${waitSeconds} && notify-send "Claude Code ✅" "${escapeShell(msg)}"`;
     const child = spawn('sh', ['-c', cmd], {
       detached: true,
@@ -261,7 +387,7 @@ function scheduleDelayedNotification(waitSeconds, config) {
 // ─── 防重复调度（锁文件机制）─────────────────────────────────────────────────
 
 const LOCK_PATH = path.join(os.homedir(), '.claude', 'rate-limit-lock.json');
-const LOCK_GRACE_SECONDS = 60; // 同一限流事件在 60 秒内只调度一次
+const LOCK_GRACE_SECONDS = 300; // 同一限流事件在 5 分钟内只调度一次
 
 function isAlreadyScheduled() {
   try {
@@ -391,7 +517,6 @@ async function main() {
   try {
     const input = JSON.parse(stdinData);
     transcriptPath = input.transcript_path || null;
-    inlineText = JSON.stringify(input);
 
     // PostToolUse 场景：有 tool_name 且有工具输出
     if (input.tool_name || input.tool_input) {
@@ -403,6 +528,17 @@ async function main() {
         input.tool_response?.content ||
         '';
       dbg(`PostToolUse mode, tool: ${input.tool_name}, output length: ${toolOutput.length}`);
+    }
+
+    // Notification hook：只扫描通知消息文本，不扫描元数据
+    // 避免 session_id、version、hook_event_name 等元数据触发误报
+    if (input.message) {
+      inlineText = typeof input.message === 'string' ? input.message : JSON.stringify(input.message);
+    } else if (input.notification) {
+      inlineText = typeof input.notification === 'string' ? input.notification : JSON.stringify(input.notification);
+    } else {
+      // PostToolUse 或无 message 字段 → 不扫描整个 JSON 元数据
+      inlineText = '';
     }
   } catch {
     // stdin 不是 JSON，当作纯文本处理
@@ -460,7 +596,7 @@ async function main() {
   dbg(`Detected rate limit. Wait: ${waitSeconds}s (${waitStr})`);
 
   // ── 立即通知用户正在等待 ──
-  sendImmediateNotification(`429 限流触发，${waitStr}后提醒恢复`);
+  sendImmediateNotification(`429 限流触发，${waitStr}后提醒恢复`, config);
 
   // ── 调度延迟通知 ──
   if (config.notification.enabled) {

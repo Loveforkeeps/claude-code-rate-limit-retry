@@ -58,6 +58,21 @@ if [[ ! -d "$CLAUDE_DIR" ]]; then
 fi
 success "Claude Code 配置目录：$CLAUDE_DIR"
 
+# macOS：检查/安装 terminal-notifier（点击通知可打开日志）
+if [[ "$(uname)" == "Darwin" ]]; then
+  if command -v terminal-notifier &>/dev/null; then
+    success "terminal-notifier 已安装（通知支持点击打开日志）"
+  else
+    warn "未安装 terminal-notifier，通知点击将无法打开日志文件"
+    if command -v brew &>/dev/null; then
+      info "正在通过 Homebrew 安装 terminal-notifier ..."
+      brew install terminal-notifier && success "terminal-notifier 安装成功" || warn "安装失败，将降级使用 osascript 通知"
+    else
+      warn "请手动安装：brew install terminal-notifier"
+    fi
+  fi
+fi
+
 # 检查源文件
 if [[ ! -f "$SRC_HOOK" ]]; then
   error "Hook 脚本不存在：$SRC_HOOK"

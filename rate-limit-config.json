@@ -6,7 +6,7 @@
   "notification": {
     "enabled": true,
     "sound": true,
-    "message": "Rate limit 已重置，爹可以继续工作了"
+    "message": "Rate limit 已重置，我可以继续工作了"
   },
   "autoResume": false,
   "logFile": "~/.claude/rate-limit-log.jsonl"
